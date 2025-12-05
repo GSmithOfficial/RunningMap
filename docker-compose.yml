@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  valhalla:
+    image: ghcr.io/gis-ops/docker-valhalla/valhalla:latest
+    container_name: valhalla
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./valhalla_data:/custom_files
+    environment:
+      # Tile building configuration
+      - tile_urls=${TILE_URL:-https://download.geofabrik.de/europe/great-britain-latest.osm.pbf}
+      - use_tiles_ignore_pbf=False
+      - force_rebuild=False
+      - force_rebuild_elevation=False
+      # Enable all costing models
+      - build_elevation=False
+      - build_admins=True
+      - build_time_zones=True
+      # Server configuration
+      - server_threads=4
+    restart: unless-stopped
+    # Give it enough time to build tiles on first run
+    healthcheck:
+      test: curl -f http://localhost:8002/status || exit 1
+      interval: 30s
+      timeout: 10s
+      retries: 100
+      start_period: 60s

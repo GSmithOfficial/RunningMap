@@ -1,85 +1,175 @@
 # Isodistance Map Calculator
 
-A fast Streamlit app that calculates how far you could travel along real road networks from a starting point and visualizes the reachable area on an interactive map.
+Calculate how far you can actually travel along road networks - no distance limits!
 
-Unlike a simple radius circle, this app uses actual road network data to show you the true reachable area based on roads, paths, and routes available.
+Shows the real area you can reach, not just a radius circle. Uses actual road data from OpenStreetMap.
 
 ## Features
 
-- **Lightning Fast**: Results in 1-2 seconds, even for 100km+ distances
-- **Real Road Networks**: Uses OpenStreetMap data via OpenRouteService
-- **Multiple Travel Modes**: Driving, walking, cycling (road/mountain), hiking, wheelchair
+- **Unlimited Distance**: Calculate 10km, 100km, or 1000km+ with local Valhalla
+- **Two Backends**: Local Valhalla (unlimited) or OpenRouteService API (easy setup)
+- **Multiple Travel Modes**: Driving, walking, cycling, bus, truck, motorcycle
 - **Distance Rings**: Visualize multiple distance ranges at once
-- **Smart Caching**: Results cached for 24 hours to save API calls
-- **Interactive Map**: Search by place name or enter coordinates
-- **Customizable**: Multiple color schemes and display options
+- **Smart Caching**: Results cached for 24 hours
+- **Offline Capable**: Works without internet once Valhalla is set up
 
 ## Quick Start
 
-### 1. Get a Free API Key
-
-1. Go to [openrouteservice.org/dev/#/signup](https://openrouteservice.org/dev/#/signup)
-2. Create a free account
-3. Copy your API key
-
-*Free tier includes 2,000 requests/day - plenty for personal use!*
-
-### 2. Install & Run
+### Option 1: OpenRouteService API (Easiest)
 
 ```bash
-# Clone the repo
-git clone <repository-url>
-cd RunningMap
-
-# Install dependencies (just 4 packages!)
 pip install -r requirements.txt
+streamlit run app.py
+```
+
+Get a free API key from [openrouteservice.org](https://openrouteservice.org/dev/#/signup) (2,000 requests/day).
+
+**Limits**: 150km max distance, requires internet.
+
+### Option 2: Local Valhalla (Unlimited - Recommended)
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Set up Valhalla (requires Docker)
+./setup_valhalla.sh
+
+# Wait for tiles to build (10min - few hours depending on region)
+docker logs -f valhalla
 
 # Run the app
 streamlit run app.py
 ```
 
-### 3. Use the App
+**No limits**: Any distance, unlimited queries, works offline.
 
-1. Enter your API key in the sidebar
-2. Search for a location or enter coordinates
-3. Set your distance (up to 150km!)
-4. Choose travel mode (driving, walking, cycling, etc.)
-5. Click "Calculate" and see results in ~1-2 seconds
+## Valhalla Setup Details
+
+The setup script lets you choose from pre-configured regions:
+
+| Region | Download Size | Build Time | Coverage |
+|--------|--------------|------------|----------|
+| Great Britain | ~1.1 GB | ~10 min | UK |
+| Germany | ~3.5 GB | ~30 min | Germany |
+| California | ~1.0 GB | ~15 min | CA, USA |
+| Europe | ~28 GB | ~3-4 hours | All of Europe |
+| North America | ~12 GB | ~2 hours | USA, Canada, Mexico |
+| Planet | ~70 GB | ~12+ hours | Entire world |
+
+### System Requirements for Valhalla
+
+| Region Size | RAM | Disk Space |
+|-------------|-----|------------|
+| Single country | 4 GB | 10 GB |
+| Continent | 16 GB | 50 GB |
+| Planet | 64+ GB | 200+ GB |
+
+### Manual Valhalla Setup
+
+If you prefer manual control:
+
+```bash
+# Create data directory
+mkdir -p valhalla_data
+
+# Download OSM data (example: Great Britain)
+wget -P valhalla_data https://download.geofabrik.de/europe/great-britain-latest.osm.pbf
+
+# Start Valhalla with Docker
+docker run -d --name valhalla \
+  -p 8002:8002 \
+  -v $(pwd)/valhalla_data:/custom_files \
+  -e tile_urls=https://download.geofabrik.de/europe/great-britain-latest.osm.pbf \
+  ghcr.io/gis-ops/docker-valhalla/valhalla:latest
+
+# Monitor build progress
+docker logs -f valhalla
+```
+
+Find more OSM extracts at [download.geofabrik.de](https://download.geofabrik.de/).
 
 ## How It Works
 
-This app uses [OpenRouteService](https://openrouteservice.org/), a powerful routing engine that:
+### With Valhalla (Local)
 
-1. **Pre-computes road networks** from OpenStreetMap data
-2. **Uses contraction hierarchies** for blazing fast graph traversal
-3. **Returns isodistance polygons** directly via API
+1. Downloads OpenStreetMap road data for your region
+2. Builds a routing graph with contraction hierarchies
+3. Calculates isodistance polygons using the `/isochrone` endpoint
+4. All processing happens locally - no external API calls
 
-This is orders of magnitude faster than downloading and processing road networks locally.
+### With OpenRouteService (API)
 
-## Performance Comparison
+1. Sends request to ORS cloud servers
+2. ORS uses pre-built global routing data
+3. Returns isodistance polygons
+4. Limited by API quotas (2,000/day free)
 
-| Approach | 10km Query | 100km Query | Dependencies |
-|----------|-----------|-------------|--------------|
-| Local OSMnx | ~30-60 sec | Not feasible | 9 packages, 500MB+ |
-| **OpenRouteService API** | **~1 sec** | **~2 sec** | **4 packages, ~50MB** |
+## Architecture
+
+```
+┌─────────────────┐     ┌──────────────────────────────────┐
+│   Streamlit UI  │────▶│         Backend Choice           │
+└─────────────────┘     └──────────────────────────────────┘
+                                      │
+                    ┌─────────────────┴─────────────────┐
+                    ▼                                   ▼
+          ┌─────────────────┐               ┌─────────────────┐
+          │ Local Valhalla  │               │  ORS API        │
+          │ (Docker)        │               │  (Cloud)        │
+          │                 │               │                 │
+          │ • Unlimited     │               │ • 150km max     │
+          │ • No API key    │               │ • 2000 req/day  │
+          │ • Works offline │               │ • Easy setup    │
+          └─────────────────┘               └─────────────────┘
+```
 
 ## Dependencies
 
-Just 4 lightweight packages:
+Just 4 packages:
 
-- `streamlit` - Web UI framework
-- `folium` - Interactive maps
-- `streamlit-folium` - Streamlit + Folium integration
-- `requests` - HTTP client for API calls
+```
+streamlit
+folium
+streamlit-folium
+requests
+```
 
-## API Limits
+Plus Docker for local Valhalla (optional).
 
-OpenRouteService free tier:
-- 2,000 requests/day
-- 40 requests/minute
-- Up to 150km distance range
+## Files
 
-For higher limits, see [ORS pricing](https://openrouteservice.org/plans/).
+```
+├── app.py               # Main Streamlit application
+├── requirements.txt     # Python dependencies
+├── docker-compose.yml   # Valhalla Docker configuration
+├── setup_valhalla.sh    # Interactive setup script
+└── README.md            # This file
+```
+
+## Troubleshooting
+
+### Valhalla won't start
+```bash
+# Check logs
+docker logs valhalla
+
+# Restart
+docker restart valhalla
+
+# Full reset
+docker rm -f valhalla
+rm -rf valhalla_data
+./setup_valhalla.sh
+```
+
+### "Location not covered" error
+Your starting point is outside your OSM data extract. Either:
+- Download a larger region
+- Choose a location within your current region
+
+### Slow calculations
+For very large distances (500km+), calculations may take 10-30 seconds. Results are cached, so subsequent queries are instant.
 
 ## License
 

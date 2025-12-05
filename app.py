@@ -1,8 +1,8 @@
 """
-Isodistance Map - Streamlit App (Optimized Version)
+Isodistance Map - Streamlit App
 
-Uses OpenRouteService API for fast isodistance calculations.
-Results in 1-2 seconds even for distances up to 100km+.
+Calculates how far you can travel along road networks and visualizes the reachable area.
+Supports both local Valhalla (unlimited) and OpenRouteService API backends.
 """
 
 import streamlit as st
@@ -14,6 +14,7 @@ import hashlib
 from pathlib import Path
 from typing import Optional
 from datetime import datetime, timedelta
+import urllib.parse
 
 # Page configuration
 st.set_page_config(
@@ -27,24 +28,32 @@ CACHE_DIR = Path(".cache")
 CACHE_DIR.mkdir(exist_ok=True)
 CACHE_EXPIRY_HOURS = 24
 
-# OpenRouteService API configuration
+# API configurations
+VALHALLA_URL = "http://localhost:8002"
 ORS_BASE_URL = "https://api.openrouteservice.org/v2/isochrones"
 
-# Profile mapping
-PROFILE_MAP = {
+# Profile mappings
+VALHALLA_PROFILES = {
+    "Driving": "auto",
+    "Walking": "pedestrian",
+    "Cycling": "bicycle",
+    "Bus": "bus",
+    "Truck": "truck",
+    "Motorcycle": "motorcycle",
+}
+
+ORS_PROFILES = {
     "Driving": "driving-car",
     "Walking": "foot-walking",
     "Cycling": "cycling-regular",
     "Cycling (Road)": "cycling-road",
-    "Cycling (Mountain)": "cycling-mountain",
     "Hiking": "foot-hiking",
-    "Wheelchair": "wheelchair"
 }
 
 
-def get_cache_key(lat: float, lon: float, distance_m: float, profile: str) -> str:
+def get_cache_key(lat: float, lon: float, distance_m: float, profile: str, backend: str) -> str:
     """Generate a unique cache key for the request."""
-    data = f"{lat:.6f},{lon:.6f},{distance_m},{profile}"
+    data = f"{backend}:{lat:.6f},{lon:.6f},{distance_m},{profile}"
     return hashlib.md5(data.encode()).hexdigest()
 
 
@@ -55,7 +64,6 @@ def get_cached_result(cache_key: str) -> Optional[dict]:
         try:
             with open(cache_file, 'r') as f:
                 cached = json.load(f)
-            # Check expiry
             cached_time = datetime.fromisoformat(cached['timestamp'])
             if datetime.now() - cached_time < timedelta(hours=CACHE_EXPIRY_HOURS):
                 return cached['data']
@@ -74,86 +82,166 @@ def save_to_cache(cache_key: str, data: dict):
         }, f)
 
 
-def calculate_isodistance(
+def check_valhalla_status() -> bool:
+    """Check if local Valhalla server is running."""
+    try:
+        response = requests.get(f"{VALHALLA_URL}/status", timeout=2)
+        return response.status_code == 200
+    except:
+        return False
+
+
+def calculate_isodistance_valhalla(
+    lat: float,
+    lon: float,
+    distances_km: list[float],
+    profile: str = "auto"
+) -> Optional[dict]:
+    """
+    Calculate isodistance using local Valhalla server.
+    NO LIMITS on distance!
+    """
+    cache_key = get_cache_key(lat, lon, max(distances_km) * 1000, profile, "valhalla")
+    cached = get_cached_result(cache_key)
+    if cached:
+        return cached
+
+    # Build contours for each distance
+    contours = [{"distance": d} for d in distances_km]
+
+    request_body = {
+        "locations": [{"lat": lat, "lon": lon}],
+        "costing": profile,
+        "contours": contours,
+        "polygons": True,
+        "denoise": 0.5,
+        "generalize": 50,  # Simplification tolerance in meters
+    }
+
+    url = f"{VALHALLA_URL}/isochrone?json={urllib.parse.quote(json.dumps(request_body))}"
+
+    try:
+        response = requests.get(url, timeout=120)  # Longer timeout for big distances
+        response.raise_for_status()
+        result = response.json()
+
+        # Convert Valhalla response to GeoJSON FeatureCollection format
+        geojson = convert_valhalla_to_geojson(result, distances_km)
+
+        save_to_cache(cache_key, geojson)
+        return geojson
+
+    except requests.exceptions.ConnectionError:
+        st.error("Cannot connect to Valhalla. Is it running? Start with: ./setup_valhalla.sh")
+        return None
+    except requests.exceptions.HTTPError as e:
+        error_detail = ""
+        try:
+            error_detail = response.json().get('error', '')
+        except:
+            pass
+        st.error(f"Valhalla error: {e} {error_detail}")
+        return None
+    except Exception as e:
+        st.error(f"Error: {e}")
+        return None
+
+
+def convert_valhalla_to_geojson(valhalla_response: dict, distances_km: list[float]) -> dict:
+    """Convert Valhalla isochrone response to standard GeoJSON FeatureCollection."""
+    features = []
+
+    if 'features' in valhalla_response:
+        # Valhalla returns GeoJSON directly
+        for i, feature in enumerate(valhalla_response['features']):
+            # Add distance value to properties
+            distance_km = distances_km[i] if i < len(distances_km) else 0
+            feature['properties']['value'] = distance_km * 1000  # Convert to meters for consistency
+            features.append(feature)
+
+    # Calculate bounding box
+    bbox = None
+    for feature in features:
+        if feature['geometry']['type'] == 'Polygon':
+            coords = feature['geometry']['coordinates'][0]
+            for lon, lat in coords:
+                if bbox is None:
+                    bbox = [lon, lat, lon, lat]
+                else:
+                    bbox[0] = min(bbox[0], lon)
+                    bbox[1] = min(bbox[1], lat)
+                    bbox[2] = max(bbox[2], lon)
+                    bbox[3] = max(bbox[3], lat)
+
+    return {
+        'type': 'FeatureCollection',
+        'features': features,
+        'bbox': bbox
+    }
+
+
+def calculate_isodistance_ors(
     api_key: str,
     lat: float,
     lon: float,
     distances_m: list[float],
     profile: str = "driving-car"
 ) -> Optional[dict]:
-    """
-    Calculate isodistance using OpenRouteService API.
-
-    Args:
-        api_key: OpenRouteService API key
-        lat, lon: Starting coordinates
-        distances_m: List of distances in meters (for multiple rings)
-        profile: Travel mode profile
-
-    Returns:
-        GeoJSON FeatureCollection with isodistance polygons
-    """
-    # Check cache first
-    cache_key = get_cache_key(lat, lon, max(distances_m), profile)
+    """Calculate isodistance using OpenRouteService API."""
+    cache_key = get_cache_key(lat, lon, max(distances_m), profile, "ors")
     cached = get_cached_result(cache_key)
     if cached:
         return cached
 
     url = f"{ORS_BASE_URL}/{profile}"
-
     headers = {
         'Authorization': api_key,
         'Content-Type': 'application/json'
     }
-
     body = {
-        'locations': [[lon, lat]],  # Note: ORS uses [lon, lat] order
+        'locations': [[lon, lat]],
         'range': distances_m,
         'range_type': 'distance',
         'units': 'm',
-        'smoothing': 25,  # Smooth the polygon edges
+        'smoothing': 25,
     }
 
     try:
         response = requests.post(url, json=body, headers=headers, timeout=30)
         response.raise_for_status()
         result = response.json()
-
-        # Cache the result
         save_to_cache(cache_key, result)
-
         return result
     except requests.exceptions.HTTPError as e:
         if response.status_code == 401:
-            st.error("Invalid API key. Please check your OpenRouteService API key.")
-        elif response.status_code == 403:
-            st.error("API key doesn't have permission for this endpoint.")
+            st.error("Invalid API key.")
         elif response.status_code == 429:
-            st.error("Rate limit exceeded. Please wait a moment and try again.")
+            st.error("Rate limit exceeded. Try local Valhalla for unlimited queries!")
         else:
             st.error(f"API Error: {e}")
         return None
-    except requests.exceptions.RequestException as e:
-        st.error(f"Network error: {e}")
+    except Exception as e:
+        st.error(f"Error: {e}")
         return None
 
 
-def geocode_place(api_key: str, place_name: str) -> Optional[tuple[float, float]]:
-    """Geocode a place name to coordinates using ORS."""
-    url = "https://api.openrouteservice.org/geocode/search"
-
-    headers = {'Authorization': api_key}
-    params = {'text': place_name, 'size': 1}
+def geocode_nominatim(place_name: str) -> Optional[tuple[float, float]]:
+    """Geocode using free Nominatim service."""
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {
+        'q': place_name,
+        'format': 'json',
+        'limit': 1
+    }
+    headers = {'User-Agent': 'IsodistanceMap/1.0'}
 
     try:
-        response = requests.get(url, headers=headers, params=params, timeout=10)
+        response = requests.get(url, params=params, headers=headers, timeout=10)
         response.raise_for_status()
         data = response.json()
-
-        if data.get('features'):
-            coords = data['features'][0]['geometry']['coordinates']
-            return coords[1], coords[0]  # Return as lat, lon
-    except Exception:
+        if data:
+            return float(data[0]['lat']), float(data[0]['lon'])
+    except:
         pass
     return None
 
@@ -165,7 +253,7 @@ def add_isodistance_to_map(m: folium.Map, geojson_data: dict, colors: list[str])
 
     features = geojson_data['features']
 
-    # Sort features by distance (largest first so smaller ones draw on top)
+    # Sort by distance (largest first so smaller ones draw on top)
     features_sorted = sorted(
         features,
         key=lambda f: f.get('properties', {}).get('value', 0),
@@ -191,69 +279,54 @@ def add_isodistance_to_map(m: folium.Map, geojson_data: dict, colors: list[str])
 
 def main():
     st.title("🗺️ Isodistance Map Calculator")
-    st.markdown("""
-    Calculate the actual area you can reach traveling a certain distance along roads.
-    Powered by OpenRouteService - results in seconds, even for 100km+ distances.
-    """)
 
-    # Check for API key
-    api_key = st.session_state.get('ors_api_key', '')
+    # Check Valhalla status
+    valhalla_available = check_valhalla_status()
 
-    # API Key setup section
+    # Sidebar
     with st.sidebar:
-        st.header("🔑 API Setup")
+        st.header("⚙️ Configuration")
 
-        with st.expander("API Key Configuration", expanded=not api_key):
-            st.markdown("""
-            This app uses [OpenRouteService](https://openrouteservice.org/) for fast calculations.
+        # Backend selection
+        st.subheader("🖥️ Backend")
 
-            **Get your free API key:**
-            1. Go to [openrouteservice.org](https://openrouteservice.org/dev/#/signup)
-            2. Create a free account
-            3. Copy your API key
-
-            *Free tier: 2,000 requests/day*
-            """)
-
-            new_api_key = st.text_input(
-                "Enter API Key",
-                value=api_key,
-                type="password",
-                help="Your OpenRouteService API key"
-            )
-
-            if new_api_key != api_key:
-                st.session_state['ors_api_key'] = new_api_key
-                api_key = new_api_key
-
-        if api_key:
-            st.success("✓ API key configured")
+        if valhalla_available:
+            st.success("✓ Local Valhalla detected!")
+            backend_options = ["Local (Valhalla) - Unlimited!", "OpenRouteService API"]
+            default_backend = 0
         else:
-            st.warning("⚠ API key required")
+            st.info("💡 Run `./setup_valhalla.sh` for unlimited distances")
+            backend_options = ["OpenRouteService API", "Local (Valhalla)"]
+            default_backend = 0
+
+        backend = st.selectbox("Select backend:", backend_options, index=default_backend)
+        use_valhalla = "Valhalla" in backend
+
+        # API key for ORS
+        api_key = ""
+        if not use_valhalla:
+            with st.expander("API Key", expanded=True):
+                st.markdown("Get free key: [openrouteservice.org](https://openrouteservice.org/dev/#/signup)")
+                api_key = st.text_input("API Key", type="password", key="ors_key")
+                if api_key:
+                    st.success("✓ Key entered")
 
         st.divider()
 
-        st.header("⚙️ Settings")
+        # Location
+        st.subheader("📍 Location")
 
-        # Location input
-        st.subheader("📍 Starting Location")
-
-        location_method = st.radio(
-            "Input method:",
-            ["Search place", "Enter coordinates"],
-            horizontal=True
-        )
+        location_method = st.radio("Input:", ["Search place", "Coordinates"], horizontal=True)
 
         if location_method == "Search place":
             place_name = st.text_input("Place name", "London, UK")
-
-            if place_name and api_key:
-                coords = geocode_place(api_key, place_name)
+            if place_name:
+                coords = geocode_nominatim(place_name)
                 if coords:
                     lat, lon = coords
                     st.caption(f"📍 {lat:.4f}, {lon:.4f}")
                 else:
-                    st.caption("Could not find location")
+                    st.caption("Location not found")
                     lat, lon = 51.5074, -0.1278
             else:
                 lat, lon = 51.5074, -0.1278
@@ -266,56 +339,58 @@ def main():
 
         st.divider()
 
-        # Distance input
+        # Distance
         st.subheader("📏 Distance")
 
         distance_unit = st.selectbox("Unit", ["Kilometers", "Miles"])
 
+        if use_valhalla:
+            # UNLIMITED distance for Valhalla!
+            max_dist = 1000.0 if distance_unit == "Kilometers" else 620.0
+            default_dist = 50.0 if distance_unit == "Kilometers" else 30.0
+            st.caption("🚀 No distance limit with local Valhalla!")
+        else:
+            # Limited for ORS
+            max_dist = 150.0 if distance_unit == "Kilometers" else 93.0
+            default_dist = 10.0 if distance_unit == "Kilometers" else 6.0
+
         if distance_unit == "Kilometers":
-            max_dist = 150.0
-            default_dist = 10.0
             distance_input = st.slider(
                 "Distance (km)",
                 min_value=1.0,
                 max_value=max_dist,
                 value=default_dist,
-                step=1.0
+                step=1.0 if max_dist <= 200 else 5.0
             )
+            distance_km = distance_input
             distance_m = distance_input * 1000
         else:
-            max_dist = 93.0  # ~150km
-            default_dist = 6.0
             distance_input = st.slider(
                 "Distance (miles)",
                 min_value=1.0,
                 max_value=max_dist,
                 value=default_dist,
-                step=1.0
+                step=1.0 if max_dist <= 100 else 5.0
             )
+            distance_km = distance_input * 1.60934
             distance_m = distance_input * 1609.34
 
-        # Show distance rings
+        # Distance rings
         show_rings = st.checkbox("Show distance rings", value=True)
-        if show_rings:
-            num_rings = st.slider("Number of rings", 1, 5, 3)
-        else:
-            num_rings = 1
+        num_rings = st.slider("Number of rings", 1, 5, 3) if show_rings else 1
 
         st.divider()
 
         # Travel mode
         st.subheader("🚗 Travel Mode")
 
-        travel_mode = st.selectbox(
-            "Mode",
-            list(PROFILE_MAP.keys()),
-            help="How you're traveling"
-        )
-        profile = PROFILE_MAP[travel_mode]
+        profiles = VALHALLA_PROFILES if use_valhalla else ORS_PROFILES
+        travel_mode = st.selectbox("Mode", list(profiles.keys()))
+        profile = profiles[travel_mode]
 
         st.divider()
 
-        # Color scheme
+        # Colors
         st.subheader("🎨 Appearance")
 
         color_schemes = {
@@ -325,28 +400,44 @@ def main():
             "Purple": ["#54278f", "#756bb1", "#9e9ac8", "#bcbddc", "#dadaeb"],
             "Orange": ["#a63603", "#e6550d", "#fd8d3c", "#fdae6b", "#fdd0a2"],
         }
-
         color_choice = st.selectbox("Color scheme", list(color_schemes.keys()))
         colors = color_schemes[color_choice]
 
         st.divider()
 
         # Calculate button
+        can_calculate = use_valhalla or api_key
         calculate_btn = st.button(
             "🚀 Calculate",
             type="primary",
             use_container_width=True,
-            disabled=not api_key
+            disabled=not can_calculate
         )
 
-    # Main map area
+        if not can_calculate:
+            st.warning("Enter API key or start local Valhalla")
+
+    # Main area
     col_map, col_info = st.columns([3, 1])
 
     with col_map:
-        # Create base map
-        m = folium.Map(location=[lat, lon], zoom_start=11, tiles="cartodbpositron")
+        # Determine zoom based on distance
+        if distance_km > 500:
+            zoom = 5
+        elif distance_km > 200:
+            zoom = 6
+        elif distance_km > 100:
+            zoom = 7
+        elif distance_km > 50:
+            zoom = 8
+        elif distance_km > 20:
+            zoom = 9
+        else:
+            zoom = 11
 
-        # Add starting point marker
+        m = folium.Map(location=[lat, lon], zoom_start=zoom, tiles="cartodbpositron")
+
+        # Starting point
         folium.Marker(
             [lat, lon],
             popup=f"Start: {lat:.4f}, {lon:.4f}",
@@ -354,87 +445,94 @@ def main():
             icon=folium.Icon(color='red', icon='play', prefix='fa')
         ).add_to(m)
 
-        # Calculate and display isodistance
-        if calculate_btn and api_key:
+        # Calculate
+        if calculate_btn:
             # Generate distance rings
             if num_rings > 1:
-                distances = [distance_m * (i + 1) / num_rings for i in range(num_rings)]
+                distances_km_list = [distance_km * (i + 1) / num_rings for i in range(num_rings)]
+                distances_m_list = [distance_m * (i + 1) / num_rings for i in range(num_rings)]
             else:
-                distances = [distance_m]
+                distances_km_list = [distance_km]
+                distances_m_list = [distance_m]
 
-            with st.spinner("Calculating reachable area..."):
-                result = calculate_isodistance(api_key, lat, lon, distances, profile)
+            with st.spinner(f"Calculating reachable area ({distance_km:.0f} km)..."):
+                if use_valhalla:
+                    result = calculate_isodistance_valhalla(lat, lon, distances_km_list, profile)
+                else:
+                    result = calculate_isodistance_ors(api_key, lat, lon, distances_m_list, profile)
 
             if result:
                 add_isodistance_to_map(m, result, colors)
 
-                # Store results
                 st.session_state['last_result'] = result
                 st.session_state['last_params'] = {
-                    'lat': lat,
-                    'lon': lon,
-                    'distance_m': distance_m,
-                    'profile': profile,
-                    'travel_mode': travel_mode
+                    'lat': lat, 'lon': lon,
+                    'distance_km': distance_km,
+                    'travel_mode': travel_mode,
+                    'backend': 'Valhalla' if use_valhalla else 'ORS'
                 }
 
-                # Fit map to bounds
+                # Fit bounds
                 if result.get('bbox'):
                     bbox = result['bbox']
                     m.fit_bounds([[bbox[1], bbox[0]], [bbox[3], bbox[2]]])
 
-                st.success("✓ Calculation complete!")
+                st.success(f"✓ Calculated {distance_km:.0f} km reachable area!")
 
-        # Show previous result if exists
+        # Show cached result
         elif 'last_result' in st.session_state:
-            result = st.session_state['last_result']
-            add_isodistance_to_map(m, result, colors)
-            if result.get('bbox'):
-                bbox = result['bbox']
+            add_isodistance_to_map(m, st.session_state['last_result'], colors)
+            if st.session_state['last_result'].get('bbox'):
+                bbox = st.session_state['last_result']['bbox']
                 m.fit_bounds([[bbox[1], bbox[0]], [bbox[3], bbox[2]]])
 
-        # Display map
         st_folium(m, width=None, height=600, key="main_map")
 
     with col_info:
         st.subheader("ℹ️ Info")
 
+        backend_name = "Valhalla (Local)" if use_valhalla else "OpenRouteService"
         st.markdown(f"""
         **Current Settings:**
-        - 📍 Location: `{lat:.4f}, {lon:.4f}`
-        - 📏 Distance: `{distance_input:.1f} {distance_unit.lower()}`
-        - 🚗 Mode: `{travel_mode}`
+        - 📍 `{lat:.4f}, {lon:.4f}`
+        - 📏 `{distance_input:.0f} {distance_unit.lower()}`
+        - 🚗 `{travel_mode}`
+        - 🖥️ `{backend_name}`
         """)
 
         if 'last_params' in st.session_state:
-            params = st.session_state['last_params']
+            p = st.session_state['last_params']
             st.divider()
             st.markdown(f"""
             **Last Calculation:**
-            - Distance: `{params['distance_m']/1000:.1f} km`
-            - Mode: `{params['travel_mode']}`
+            - {p['distance_km']:.0f} km via {p['backend']}
             """)
 
         st.divider()
 
-        st.markdown("""
-        **How it works:**
+        if use_valhalla:
+            st.markdown("""
+            **🚀 Valhalla Backend**
 
-        Uses [OpenRouteService](https://openrouteservice.org/) routing engine with:
-        - Pre-computed road network graphs
-        - Contraction hierarchies for speed
-        - Real road data from OpenStreetMap
+            Running locally with **no limits**:
+            - Any distance (1000km+)
+            - Unlimited queries
+            - No API keys needed
+            - Works offline
 
-        **Performance:**
-        - ~1-2 seconds for any distance
-        - Up to 150km supported
-        - Results are cached for 24h
+            Data coverage depends on your OSM extract.
+            """)
+        else:
+            st.markdown("""
+            **☁️ OpenRouteService API**
 
-        **Tips:**
-        - Different travel modes give very different results
-        - Urban areas have more roads = larger reachable area
-        - Try "Walking" vs "Driving" to see the difference
-        """)
+            Cloud-based routing:
+            - Max 150km distance
+            - 2,000 requests/day
+            - Requires API key
+
+            For unlimited: run `./setup_valhalla.sh`
+            """)
 
 
 if __name__ == "__main__":
