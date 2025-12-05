@@ -1,25 +1,19 @@
 """
-Isodistance Map - Streamlit App
+Isodistance Map - Streamlit App (Optimized Version)
 
-This app calculates how far you could travel along road networks from a starting point
-and visualizes the reachable area on a map.
+Uses OpenRouteService API for fast isodistance calculations.
+Results in 1-2 seconds even for distances up to 100km+.
 """
 
 import streamlit as st
 import folium
-from streamlit_folium import st_folium, folium_static
-import osmnx as ox
-import networkx as nx
-from shapely.geometry import Point, Polygon, MultiPolygon
-from shapely.ops import unary_union
-from scipy.spatial import ConvexHull
-import numpy as np
-import geopandas as gpd
-from folium.plugins import Draw
-
-# Configure OSMnx
-ox.settings.use_cache = True
-ox.settings.log_console = False
+from streamlit_folium import st_folium
+import requests
+import json
+import hashlib
+from pathlib import Path
+from typing import Optional
+from datetime import datetime, timedelta
 
 # Page configuration
 st.set_page_config(
@@ -28,366 +22,418 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("🗺️ Isodistance Map Calculator")
-st.markdown("""
-This app shows you the actual area you could cover traveling a certain distance along roads.
-Unlike a simple radius circle, this calculates reachable areas using real road networks.
-""")
+# Cache directory
+CACHE_DIR = Path(".cache")
+CACHE_DIR.mkdir(exist_ok=True)
+CACHE_EXPIRY_HOURS = 24
+
+# OpenRouteService API configuration
+ORS_BASE_URL = "https://api.openrouteservice.org/v2/isochrones"
+
+# Profile mapping
+PROFILE_MAP = {
+    "Driving": "driving-car",
+    "Walking": "foot-walking",
+    "Cycling": "cycling-regular",
+    "Cycling (Road)": "cycling-road",
+    "Cycling (Mountain)": "cycling-mountain",
+    "Hiking": "foot-hiking",
+    "Wheelchair": "wheelchair"
+}
 
 
-def get_network_graph(center_lat: float, center_lon: float, distance_km: float) -> nx.MultiDiGraph:
-    """
-    Download road network graph for the area.
-    We need to download a slightly larger area to ensure we capture all reachable roads.
-    """
-    # Buffer the distance to ensure we get enough network
-    buffer_distance = distance_km * 1000 * 1.3  # Convert to meters with buffer
-
-    # Cap the download size to prevent very long downloads
-    max_distance = 50000  # 50km max download radius
-    buffer_distance = min(buffer_distance, max_distance)
-
-    try:
-        G = ox.graph_from_point(
-            (center_lat, center_lon),
-            dist=buffer_distance,
-            network_type='drive',  # Use 'walk' for walking, 'bike' for cycling
-            simplify=True
-        )
-        return G
-    except Exception as e:
-        st.error(f"Error downloading road network: {e}")
-        return None
+def get_cache_key(lat: float, lon: float, distance_m: float, profile: str) -> str:
+    """Generate a unique cache key for the request."""
+    data = f"{lat:.6f},{lon:.6f},{distance_m},{profile}"
+    return hashlib.md5(data.encode()).hexdigest()
 
 
-def calculate_isodistance(G: nx.MultiDiGraph, center_lat: float, center_lon: float,
-                          distance_m: float) -> list:
-    """
-    Calculate all nodes reachable within the given distance from the center point.
-    Returns list of (lat, lon) tuples for reachable nodes.
-    """
-    # Find the nearest node to our center point
-    center_node = ox.nearest_nodes(G, center_lon, center_lat)
-
-    # Calculate shortest path distances from center to all nodes
-    # Using Dijkstra's algorithm with edge length as weight
-    distances = nx.single_source_dijkstra_path_length(G, center_node, cutoff=distance_m, weight='length')
-
-    # Get coordinates of all reachable nodes
-    reachable_points = []
-    for node_id in distances.keys():
-        node_data = G.nodes[node_id]
-        reachable_points.append((node_data['y'], node_data['x']))  # lat, lon
-
-    return reachable_points
-
-
-def create_isodistance_polygon(points: list, method: str = 'concave') -> Polygon:
-    """
-    Create a polygon from the reachable points.
-    """
-    if len(points) < 3:
-        return None
-
-    points_array = np.array(points)
-
-    if method == 'convex':
-        # Simple convex hull
+def get_cached_result(cache_key: str) -> Optional[dict]:
+    """Retrieve cached result if it exists and is not expired."""
+    cache_file = CACHE_DIR / f"{cache_key}.json"
+    if cache_file.exists():
         try:
-            hull = ConvexHull(points_array)
-            hull_points = points_array[hull.vertices]
-            return Polygon(hull_points)
-        except Exception:
-            return None
-    else:
-        # Concave hull using alpha shape (better representation)
-        try:
-            # Create a GeoDataFrame with points
-            geometry = [Point(lon, lat) for lat, lon in points]
-            gdf = gpd.GeoDataFrame(geometry=geometry, crs="EPSG:4326")
-
-            # Buffer each point slightly and union them for a more accurate shape
-            # The buffer size is proportional to the density of points
-            if len(points) > 0:
-                # Calculate approximate point density
-                lat_range = points_array[:, 0].max() - points_array[:, 0].min()
-                lon_range = points_array[:, 1].max() - points_array[:, 1].min()
-                area = max(lat_range, 0.001) * max(lon_range, 0.001)
-                buffer_size = np.sqrt(area / len(points)) * 1.5
-                buffer_size = max(buffer_size, 0.0005)  # Minimum buffer
-                buffer_size = min(buffer_size, 0.01)    # Maximum buffer
-
-                # Buffer and union
-                buffered = gdf.geometry.buffer(buffer_size)
-                unified = unary_union(buffered)
-
-                # Simplify the result
-                simplified = unified.simplify(buffer_size / 2)
-                return simplified
-        except Exception as e:
-            # Fall back to convex hull
-            try:
-                hull = ConvexHull(points_array)
-                hull_points = points_array[hull.vertices]
-                return Polygon([(p[1], p[0]) for p in hull_points])  # lon, lat for Polygon
-            except Exception:
-                return None
-
+            with open(cache_file, 'r') as f:
+                cached = json.load(f)
+            # Check expiry
+            cached_time = datetime.fromisoformat(cached['timestamp'])
+            if datetime.now() - cached_time < timedelta(hours=CACHE_EXPIRY_HOURS):
+                return cached['data']
+        except (json.JSONDecodeError, KeyError):
+            pass
     return None
 
 
-def add_polygon_to_map(m: folium.Map, polygon, color: str = '#3388ff',
-                       fill_opacity: float = 0.35):
+def save_to_cache(cache_key: str, data: dict):
+    """Save result to cache."""
+    cache_file = CACHE_DIR / f"{cache_key}.json"
+    with open(cache_file, 'w') as f:
+        json.dump({
+            'timestamp': datetime.now().isoformat(),
+            'data': data
+        }, f)
+
+
+def calculate_isodistance(
+    api_key: str,
+    lat: float,
+    lon: float,
+    distances_m: list[float],
+    profile: str = "driving-car"
+) -> Optional[dict]:
     """
-    Add a polygon (or multipolygon) to the folium map.
+    Calculate isodistance using OpenRouteService API.
+
+    Args:
+        api_key: OpenRouteService API key
+        lat, lon: Starting coordinates
+        distances_m: List of distances in meters (for multiple rings)
+        profile: Travel mode profile
+
+    Returns:
+        GeoJSON FeatureCollection with isodistance polygons
     """
-    if polygon is None:
+    # Check cache first
+    cache_key = get_cache_key(lat, lon, max(distances_m), profile)
+    cached = get_cached_result(cache_key)
+    if cached:
+        return cached
+
+    url = f"{ORS_BASE_URL}/{profile}"
+
+    headers = {
+        'Authorization': api_key,
+        'Content-Type': 'application/json'
+    }
+
+    body = {
+        'locations': [[lon, lat]],  # Note: ORS uses [lon, lat] order
+        'range': distances_m,
+        'range_type': 'distance',
+        'units': 'm',
+        'smoothing': 25,  # Smooth the polygon edges
+    }
+
+    try:
+        response = requests.post(url, json=body, headers=headers, timeout=30)
+        response.raise_for_status()
+        result = response.json()
+
+        # Cache the result
+        save_to_cache(cache_key, result)
+
+        return result
+    except requests.exceptions.HTTPError as e:
+        if response.status_code == 401:
+            st.error("Invalid API key. Please check your OpenRouteService API key.")
+        elif response.status_code == 403:
+            st.error("API key doesn't have permission for this endpoint.")
+        elif response.status_code == 429:
+            st.error("Rate limit exceeded. Please wait a moment and try again.")
+        else:
+            st.error(f"API Error: {e}")
+        return None
+    except requests.exceptions.RequestException as e:
+        st.error(f"Network error: {e}")
+        return None
+
+
+def geocode_place(api_key: str, place_name: str) -> Optional[tuple[float, float]]:
+    """Geocode a place name to coordinates using ORS."""
+    url = "https://api.openrouteservice.org/geocode/search"
+
+    headers = {'Authorization': api_key}
+    params = {'text': place_name, 'size': 1}
+
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+
+        if data.get('features'):
+            coords = data['features'][0]['geometry']['coordinates']
+            return coords[1], coords[0]  # Return as lat, lon
+    except Exception:
+        pass
+    return None
+
+
+def add_isodistance_to_map(m: folium.Map, geojson_data: dict, colors: list[str]):
+    """Add isodistance polygons to the map."""
+    if not geojson_data or 'features' not in geojson_data:
         return
 
-    if isinstance(polygon, MultiPolygon):
-        for poly in polygon.geoms:
-            coords = [(lat, lon) for lon, lat in poly.exterior.coords]
-            folium.Polygon(
-                locations=coords,
-                color=color,
-                weight=2,
-                fill=True,
-                fill_color=color,
-                fill_opacity=fill_opacity,
-                popup="Reachable Area"
-            ).add_to(m)
-    elif isinstance(polygon, Polygon):
-        coords = [(lat, lon) for lon, lat in polygon.exterior.coords]
-        folium.Polygon(
-            locations=coords,
-            color=color,
-            weight=2,
-            fill=True,
-            fill_color=color,
-            fill_opacity=fill_opacity,
-            popup="Reachable Area"
+    features = geojson_data['features']
+
+    # Sort features by distance (largest first so smaller ones draw on top)
+    features_sorted = sorted(
+        features,
+        key=lambda f: f.get('properties', {}).get('value', 0),
+        reverse=True
+    )
+
+    for i, feature in enumerate(features_sorted):
+        color = colors[i % len(colors)]
+        distance_m = feature.get('properties', {}).get('value', 0)
+        distance_km = distance_m / 1000
+
+        folium.GeoJson(
+            feature,
+            style_function=lambda x, c=color: {
+                'fillColor': c,
+                'color': c,
+                'weight': 2,
+                'fillOpacity': 0.3,
+            },
+            tooltip=f"{distance_km:.1f} km"
         ).add_to(m)
 
 
 def main():
-    # Sidebar for inputs
+    st.title("🗺️ Isodistance Map Calculator")
+    st.markdown("""
+    Calculate the actual area you can reach traveling a certain distance along roads.
+    Powered by OpenRouteService - results in seconds, even for 100km+ distances.
+    """)
+
+    # Check for API key
+    api_key = st.session_state.get('ors_api_key', '')
+
+    # API Key setup section
     with st.sidebar:
+        st.header("🔑 API Setup")
+
+        with st.expander("API Key Configuration", expanded=not api_key):
+            st.markdown("""
+            This app uses [OpenRouteService](https://openrouteservice.org/) for fast calculations.
+
+            **Get your free API key:**
+            1. Go to [openrouteservice.org](https://openrouteservice.org/dev/#/signup)
+            2. Create a free account
+            3. Copy your API key
+
+            *Free tier: 2,000 requests/day*
+            """)
+
+            new_api_key = st.text_input(
+                "Enter API Key",
+                value=api_key,
+                type="password",
+                help="Your OpenRouteService API key"
+            )
+
+            if new_api_key != api_key:
+                st.session_state['ors_api_key'] = new_api_key
+                api_key = new_api_key
+
+        if api_key:
+            st.success("✓ API key configured")
+        else:
+            st.warning("⚠ API key required")
+
+        st.divider()
+
         st.header("⚙️ Settings")
 
+        # Location input
         st.subheader("📍 Starting Location")
 
-        # Location input method
         location_method = st.radio(
-            "Choose input method:",
-            ["Enter coordinates", "Search by place name", "Click on map"]
+            "Input method:",
+            ["Search place", "Enter coordinates"],
+            horizontal=True
         )
 
-        if location_method == "Enter coordinates":
-            col1, col2 = st.columns(2)
-            with col1:
-                lat = st.number_input("Latitude", value=51.5074, format="%.6f",
-                                      min_value=-90.0, max_value=90.0)
-            with col2:
-                lon = st.number_input("Longitude", value=-0.1278, format="%.6f",
-                                      min_value=-180.0, max_value=180.0)
+        if location_method == "Search place":
+            place_name = st.text_input("Place name", "London, UK")
 
-        elif location_method == "Search by place name":
-            place_name = st.text_input("Enter place name", "London, UK")
-            if place_name:
-                try:
-                    location = ox.geocode(place_name)
-                    lat, lon = location
-                    st.success(f"Found: {lat:.4f}, {lon:.4f}")
-                except Exception as e:
-                    st.error("Could not find location. Please try another search.")
+            if place_name and api_key:
+                coords = geocode_place(api_key, place_name)
+                if coords:
+                    lat, lon = coords
+                    st.caption(f"📍 {lat:.4f}, {lon:.4f}")
+                else:
+                    st.caption("Could not find location")
                     lat, lon = 51.5074, -0.1278
             else:
                 lat, lon = 51.5074, -0.1278
-
-        else:  # Click on map
-            st.info("Click on the map to set your starting point")
-            lat = st.session_state.get('clicked_lat', 51.5074)
-            lon = st.session_state.get('clicked_lon', -0.1278)
-            st.write(f"Current: {lat:.4f}, {lon:.4f}")
+        else:
+            col1, col2 = st.columns(2)
+            with col1:
+                lat = st.number_input("Latitude", value=51.5074, format="%.6f")
+            with col2:
+                lon = st.number_input("Longitude", value=-0.1278, format="%.6f")
 
         st.divider()
-
-        st.subheader("📏 Distance")
 
         # Distance input
-        distance_unit = st.selectbox("Unit", ["Kilometers", "Miles", "Meters"])
+        st.subheader("📏 Distance")
+
+        distance_unit = st.selectbox("Unit", ["Kilometers", "Miles"])
 
         if distance_unit == "Kilometers":
-            distance_input = st.number_input("Distance (km)", min_value=0.1, max_value=100.0,
-                                             value=5.0, step=0.5)
+            max_dist = 150.0
+            default_dist = 10.0
+            distance_input = st.slider(
+                "Distance (km)",
+                min_value=1.0,
+                max_value=max_dist,
+                value=default_dist,
+                step=1.0
+            )
             distance_m = distance_input * 1000
-        elif distance_unit == "Miles":
-            distance_input = st.number_input("Distance (miles)", min_value=0.1, max_value=62.0,
-                                             value=3.0, step=0.5)
-            distance_m = distance_input * 1609.34
         else:
-            distance_input = st.number_input("Distance (meters)", min_value=100, max_value=100000,
-                                             value=5000, step=100)
-            distance_m = distance_input
+            max_dist = 93.0  # ~150km
+            default_dist = 6.0
+            distance_input = st.slider(
+                "Distance (miles)",
+                min_value=1.0,
+                max_value=max_dist,
+                value=default_dist,
+                step=1.0
+            )
+            distance_m = distance_input * 1609.34
+
+        # Show distance rings
+        show_rings = st.checkbox("Show distance rings", value=True)
+        if show_rings:
+            num_rings = st.slider("Number of rings", 1, 5, 3)
+        else:
+            num_rings = 1
 
         st.divider()
 
-        st.subheader("🎨 Display Options")
+        # Travel mode
+        st.subheader("🚗 Travel Mode")
 
-        # Network type
-        network_type = st.selectbox(
-            "Travel mode",
-            ["Drive", "Walk", "Bike", "All roads"],
-            help="Type of road network to use"
+        travel_mode = st.selectbox(
+            "Mode",
+            list(PROFILE_MAP.keys()),
+            help="How you're traveling"
         )
-        network_type_map = {
-            "Drive": "drive",
-            "Walk": "walk",
-            "Bike": "bike",
-            "All roads": "all"
+        profile = PROFILE_MAP[travel_mode]
+
+        st.divider()
+
+        # Color scheme
+        st.subheader("🎨 Appearance")
+
+        color_schemes = {
+            "Blue": ["#08519c", "#3182bd", "#6baed6", "#9ecae1", "#c6dbef"],
+            "Green": ["#006d2c", "#31a354", "#74c476", "#a1d99b", "#c7e9c0"],
+            "Red": ["#a50f15", "#de2d26", "#fb6a4a", "#fc9272", "#fcbba1"],
+            "Purple": ["#54278f", "#756bb1", "#9e9ac8", "#bcbddc", "#dadaeb"],
+            "Orange": ["#a63603", "#e6550d", "#fd8d3c", "#fdae6b", "#fdd0a2"],
         }
 
-        # Color picker
-        area_color = st.color_picker("Area color", "#3388ff")
-
-        # Opacity
-        fill_opacity = st.slider("Fill opacity", 0.1, 0.8, 0.35)
-
-        # Polygon method
-        polygon_method = st.selectbox(
-            "Shape method",
-            ["Smooth (concave)", "Simple (convex)"],
-            help="How to draw the reachable area boundary"
-        )
+        color_choice = st.selectbox("Color scheme", list(color_schemes.keys()))
+        colors = color_schemes[color_choice]
 
         st.divider()
 
         # Calculate button
-        calculate_btn = st.button("🚀 Calculate Reachable Area", type="primary",
-                                  use_container_width=True)
+        calculate_btn = st.button(
+            "🚀 Calculate",
+            type="primary",
+            use_container_width=True,
+            disabled=not api_key
+        )
 
-    # Main content area
+    # Main map area
     col_map, col_info = st.columns([3, 1])
 
     with col_map:
-        # Create the base map
-        m = folium.Map(location=[lat, lon], zoom_start=12)
+        # Create base map
+        m = folium.Map(location=[lat, lon], zoom_start=11, tiles="cartodbpositron")
 
-        # Add marker for starting point
+        # Add starting point marker
         folium.Marker(
             [lat, lon],
-            popup=f"Start: ({lat:.4f}, {lon:.4f})",
+            popup=f"Start: {lat:.4f}, {lon:.4f}",
             tooltip="Starting Point",
-            icon=folium.Icon(color='red', icon='play')
+            icon=folium.Icon(color='red', icon='play', prefix='fa')
         ).add_to(m)
 
-        # Add draw control for clicking
-        if location_method == "Click on map":
-            Draw(
-                draw_options={
-                    'polyline': False,
-                    'polygon': False,
-                    'circle': False,
-                    'rectangle': False,
-                    'circlemarker': False,
-                    'marker': True
-                },
-                edit_options={'edit': False}
-            ).add_to(m)
+        # Calculate and display isodistance
+        if calculate_btn and api_key:
+            # Generate distance rings
+            if num_rings > 1:
+                distances = [distance_m * (i + 1) / num_rings for i in range(num_rings)]
+            else:
+                distances = [distance_m]
 
-        # Handle calculation
-        if calculate_btn:
-            with st.spinner("Downloading road network... This may take a moment."):
-                # Download network
-                try:
-                    G = ox.graph_from_point(
-                        (lat, lon),
-                        dist=min(distance_m * 1.3, 50000),
-                        network_type=network_type_map[network_type],
-                        simplify=True
-                    )
-                except Exception as e:
-                    st.error(f"Error downloading road network: {e}")
-                    G = None
+            with st.spinner("Calculating reachable area..."):
+                result = calculate_isodistance(api_key, lat, lon, distances, profile)
 
-            if G is not None:
-                with st.spinner("Calculating reachable area..."):
-                    # Calculate isodistance
-                    reachable_points = calculate_isodistance(G, lat, lon, distance_m)
+            if result:
+                add_isodistance_to_map(m, result, colors)
 
-                    if len(reachable_points) >= 3:
-                        # Create polygon
-                        method = 'concave' if 'concave' in polygon_method.lower() else 'convex'
-                        polygon = create_isodistance_polygon(reachable_points, method)
+                # Store results
+                st.session_state['last_result'] = result
+                st.session_state['last_params'] = {
+                    'lat': lat,
+                    'lon': lon,
+                    'distance_m': distance_m,
+                    'profile': profile,
+                    'travel_mode': travel_mode
+                }
 
-                        # Add to map
-                        add_polygon_to_map(m, polygon, area_color, fill_opacity)
+                # Fit map to bounds
+                if result.get('bbox'):
+                    bbox = result['bbox']
+                    m.fit_bounds([[bbox[1], bbox[0]], [bbox[3], bbox[2]]])
 
-                        # Add points as a subtle layer
-                        for point in reachable_points[::max(1, len(reachable_points)//200)]:
-                            folium.CircleMarker(
-                                location=point,
-                                radius=2,
-                                color=area_color,
-                                fill=True,
-                                opacity=0.3
-                            ).add_to(m)
+                st.success("✓ Calculation complete!")
 
-                        # Fit bounds
-                        if polygon is not None:
-                            bounds = polygon.bounds  # minx, miny, maxx, maxy
-                            m.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
+        # Show previous result if exists
+        elif 'last_result' in st.session_state:
+            result = st.session_state['last_result']
+            add_isodistance_to_map(m, result, colors)
+            if result.get('bbox'):
+                bbox = result['bbox']
+                m.fit_bounds([[bbox[1], bbox[0]], [bbox[3], bbox[2]]])
 
-                        # Store results in session state
-                        st.session_state['last_calculation'] = {
-                            'num_points': len(reachable_points),
-                            'distance_m': distance_m,
-                            'network_type': network_type
-                        }
-
-                        st.success(f"Found {len(reachable_points)} reachable road intersections!")
-                    else:
-                        st.warning("Not enough road network data found for this location.")
-
-        # Display the map
-        map_data = st_folium(m, width=None, height=600, key="main_map")
-
-        # Handle map clicks
-        if map_data and map_data.get('last_clicked'):
-            clicked = map_data['last_clicked']
-            st.session_state['clicked_lat'] = clicked['lat']
-            st.session_state['clicked_lon'] = clicked['lng']
+        # Display map
+        st_folium(m, width=None, height=600, key="main_map")
 
     with col_info:
-        st.subheader("ℹ️ Information")
+        st.subheader("ℹ️ Info")
 
         st.markdown(f"""
         **Current Settings:**
-        - 📍 Location: ({lat:.4f}, {lon:.4f})
-        - 📏 Distance: {distance_input} {distance_unit.lower()}
-        - 🚗 Mode: {network_type}
+        - 📍 Location: `{lat:.4f}, {lon:.4f}`
+        - 📏 Distance: `{distance_input:.1f} {distance_unit.lower()}`
+        - 🚗 Mode: `{travel_mode}`
         """)
 
-        if 'last_calculation' in st.session_state:
-            calc = st.session_state['last_calculation']
+        if 'last_params' in st.session_state:
+            params = st.session_state['last_params']
+            st.divider()
             st.markdown(f"""
             **Last Calculation:**
-            - Road points found: {calc['num_points']}
-            - Distance used: {calc['distance_m']/1000:.1f} km
+            - Distance: `{params['distance_m']/1000:.1f} km`
+            - Mode: `{params['travel_mode']}`
             """)
 
         st.divider()
 
         st.markdown("""
         **How it works:**
-        1. Downloads real road network data from OpenStreetMap
-        2. Calculates all reachable points within your distance using Dijkstra's algorithm
-        3. Creates a polygon encompassing the reachable area
+
+        Uses [OpenRouteService](https://openrouteservice.org/) routing engine with:
+        - Pre-computed road network graphs
+        - Contraction hierarchies for speed
+        - Real road data from OpenStreetMap
+
+        **Performance:**
+        - ~1-2 seconds for any distance
+        - Up to 150km supported
+        - Results are cached for 24h
 
         **Tips:**
-        - Larger distances take longer to calculate
-        - Urban areas have denser road networks
-        - Try different travel modes for different results
+        - Different travel modes give very different results
+        - Urban areas have more roads = larger reachable area
+        - Try "Walking" vs "Driving" to see the difference
         """)
 
 
